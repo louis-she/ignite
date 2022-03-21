@@ -5,9 +5,10 @@ from contextlib import redirect_stdout
 import numpy as np
 import pycocotools.mask as mask_util
 import torch
+from pycocotools import mask as coco_mask
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
-from pycocotools import mask as coco_mask
+
 from ignite.metrics import Metric
 
 
@@ -64,7 +65,6 @@ def convert_to_coco_api(ds):
 
 
 class CocoEvaluator:
-
     def __init__(self, coco_gt, iou_types):
         if not isinstance(iou_types, (list, tuple)):
             raise TypeError(f"This constructor expects iou_types of type list or tuple, instead  got {type(iou_types)}")
@@ -226,13 +226,12 @@ def evaluate(imgs):
 
 
 class CocoMetric(Metric):
-
     def __init__(self, coco_api, *args, **kwargs):
-        self.coco_evaluator = CocoEvaluator(coco_api, ['bbox'])
+        self.coco_evaluator = CocoEvaluator(coco_api, ["bbox"])
         super().__init__(*args, **kwargs)
 
     def update(self, output):
-        y_pred, y = output['y_pred'], output['y']
+        y_pred, y = output["y_pred"], output["y"]
         res = {target["image_id"]: output for target, output in zip(y, y_pred)}
         self.coco_evaluator.update(res)
 
@@ -246,4 +245,4 @@ class CocoMetric(Metric):
     def compute(self):
         self.coco_evaluator.accumulate()
         self.coco_evaluator.summarize()
-        return self.coco_evaluator.coco_eval['bbox'].stats[0]
+        return self.coco_evaluator.coco_eval["bbox"].stats[0]
