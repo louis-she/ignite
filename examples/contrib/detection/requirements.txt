@@ -1,0 +1,4 @@
+pytorch-ignite
+torchvision
+tqdm
+aim
