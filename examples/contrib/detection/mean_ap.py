@@ -1,3 +1,7 @@
+"""
+Evaluation code is mainly taken credit from torchvision coco_eval.
+reference: https://github.com/pytorch/vision/blob/main/references/detection/coco_eval.py
+"""
 import copy
 import io
 from contextlib import redirect_stdout
