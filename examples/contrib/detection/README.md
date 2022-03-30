@@ -20,13 +20,15 @@ Alternatively, install the all requirements using `pip install -r requirements.t
 ## Usage:
 
 ```bash
-python faster_rcnn.py
+python main.py exp_name
 ```
 
 For details on accepted arguments:
 
 ```bash
-python faster_rcnn.py --help
+python main.py --help
 ```
 
 The datasets will be downloaded automatically, if you already has the VOC2012, you can use the `--dataset-root` option to locate it.
+
+You can use `aim up` in the log directory(defaults to `./log/aim`) then visit `http://127.0.0.1:43800` to see visualizations.
