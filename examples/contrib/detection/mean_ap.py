@@ -38,13 +38,6 @@ def convert_to_coco_api(ds):
         labels = targets["labels"].tolist()
         areas = targets["area"].tolist()
         iscrowd = targets["iscrowd"].tolist()
-        if "masks" in targets:
-            masks = targets["masks"]
-            # make masks Fortran contiguous for coco_mask
-            masks = masks.permute(0, 2, 1).contiguous().permute(0, 2, 1)
-        if "keypoints" in targets:
-            keypoints = targets["keypoints"]
-            keypoints = keypoints.reshape(keypoints.shape[0], -1).tolist()
         num_objs = len(bboxes)
         for i in range(num_objs):
             ann = {}
@@ -55,11 +48,6 @@ def convert_to_coco_api(ds):
             ann["area"] = areas[i]
             ann["iscrowd"] = iscrowd[i]
             ann["id"] = ann_id
-            if "masks" in targets:
-                ann["segmentation"] = coco_mask.encode(masks[i].numpy())
-            if "keypoints" in targets:
-                ann["keypoints"] = keypoints[i]
-                ann["num_keypoints"] = sum(k != 0 for k in keypoints[i][2::3])
             dataset["annotations"].append(ann)
             ann_id += 1
     dataset["categories"] = [{"id": i} for i in sorted(categories)]
@@ -69,60 +57,36 @@ def convert_to_coco_api(ds):
 
 
 class CocoEvaluator:
-    def __init__(self, coco_gt, iou_types):
-        if not isinstance(iou_types, (list, tuple)):
-            raise TypeError(f"This constructor expects iou_types of type list or tuple, instead  got {type(iou_types)}")
+    def __init__(self, coco_gt):
         coco_gt = copy.deepcopy(coco_gt)
         self.coco_gt = coco_gt
-
-        self.iou_types = iou_types
-        self.coco_eval = {}
-        for iou_type in self.iou_types:
-            self.coco_eval[iou_type] = COCOeval(coco_gt, iouType=iou_type)
+        self.coco_eval = COCOeval(coco_gt, iouType="bbox")
         self.reset()
 
     def reset(self):
         self.img_ids = []
-        self.eval_imgs = {k: [] for k in self.iou_types}
+        self.eval_imgs = []
 
     def update(self, predictions):
         img_ids = list(np.unique(list(predictions.keys())))
         self.img_ids.extend(img_ids)
-
-        for iou_type in self.iou_types:
-            results = self.prepare(predictions, iou_type)
-            with redirect_stdout(io.StringIO()):
-                coco_dt = COCO.loadRes(self.coco_gt, results) if results else COCO()
-            coco_eval = self.coco_eval[iou_type]
-
-            coco_eval.cocoDt = coco_dt
-            coco_eval.params.imgIds = list(img_ids)
-            img_ids, eval_imgs = evaluate(coco_eval)
-
-            self.eval_imgs[iou_type].append(eval_imgs)
-
-    def synchronize_between_processes(self):
-        for iou_type in self.iou_types:
-            self.eval_imgs[iou_type] = np.concatenate(self.eval_imgs[iou_type], 2)
-            create_common_coco_eval(self.coco_eval[iou_type], self.img_ids, self.eval_imgs[iou_type])
+        results = self.prepare(predictions)
+        with redirect_stdout(io.StringIO()):
+            coco_dt = COCO.loadRes(self.coco_gt, results) if results else COCO()
+        self.coco_eval.cocoDt = coco_dt
+        self.coco_eval.params.imgIds = list(img_ids)
+        img_ids, eval_imgs = evaluate(self.coco_eval)
+        self.eval_imgs.append(eval_imgs)
 
     def accumulate(self):
-        for coco_eval in self.coco_eval.values():
-            coco_eval.accumulate()
+        self.coco_eval.accumulate()
 
     def summarize(self):
-        for iou_type, coco_eval in self.coco_eval.items():
-            print(f"IoU metric: {iou_type}")
-            coco_eval.summarize()
+        print(f"IoU metric: bbox")
+        self.coco_eval.summarize()
 
-    def prepare(self, predictions, iou_type):
-        if iou_type == "bbox":
-            return self.prepare_for_coco_detection(predictions)
-        if iou_type == "segm":
-            return self.prepare_for_coco_segmentation(predictions)
-        if iou_type == "keypoints":
-            return self.prepare_for_coco_keypoint(predictions)
-        raise ValueError(f"Unknown iou type {iou_type}")
+    def prepare(self, predictions):
+        return self.prepare_for_coco_detection(predictions)
 
     def prepare_for_coco_detection(self, predictions):
         coco_results = []
@@ -231,7 +195,7 @@ def evaluate(imgs):
 
 class CocoMetric(Metric):
     def __init__(self, coco_api, *args, **kwargs):
-        self.coco_evaluator = CocoEvaluator(coco_api, ["bbox"])
+        self.coco_evaluator = CocoEvaluator(coco_api)
         super().__init__(*args, **kwargs)
 
     def update(self, output):
@@ -249,4 +213,4 @@ class CocoMetric(Metric):
     def compute(self):
         self.coco_evaluator.accumulate()
         self.coco_evaluator.summarize()
-        return self.coco_evaluator.coco_eval["bbox"].stats[0]
+        return self.coco_evaluator.coco_eval.stats[0]

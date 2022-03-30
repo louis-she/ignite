@@ -1,11 +1,10 @@
 import os
 import random
-import sys
-from argparse import ArgumentParser
 from typing import Any, Tuple
 
 import aim
 import albumentations as A
+import fire
 import numpy as np
 import torch
 from aim.pytorch_ignite import AimLogger
@@ -17,7 +16,7 @@ from torch.optim import SGD
 from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils.data import DataLoader, Subset
 from torchvision.datasets import VOCDetection
-from torchvision.models.detection import fasterrcnn_resnet50_fpn
+from torchvision.models import detection
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.utils import draw_bounding_boxes
 
@@ -31,6 +30,12 @@ try:
     from defusedxml.ElementTree import parse as ET_parse
 except ImportError:
     from xml.etree.ElementTree import parse as ET_parse
+
+AVAILABLE_MODELS = [
+    "fasterrcnn_resnet50_fpn",
+    "fasterrcnn_mobilenet_v3_large_fpn",
+    "fasterrcnn_mobilenet_v3_large_320_fpn",
+]
 
 
 class Dataset(VOCDetection):
@@ -96,16 +101,36 @@ def collate_fn(batch):
 
 
 def run(
-    experiment_name,
-    dataset_root: str,
-    log_dir: str,
-    epochs: int,
-    batch_size: int,
-    lr: int,
-    download: bool,
-    device: str,
-    image_size: int,
+    experiment_name: str,
+    dataset_root: str = "./dataset",
+    log_dir: str = "./log",
+    model: str = "fasterrcnn_resnet50_fpn",
+    epochs: int = 13,
+    batch_size: int = 4,
+    lr: int = 0.01,
+    download: bool = False,
+    device: str = "cuda",
+    image_size: int = 256,
 ) -> None:
+    """
+    Args:
+        experiment_name: the name of each run
+        dataset_root: dataset root directory for VOC2012 Dataset
+        log_dir: where to put all the logs
+        epochs: number of epochs to train
+        model: model to use, possible options are
+            "fasterrcnn_resnet50_fpn",
+            "fasterrcnn_mobilenet_v3_large_fpn",
+            "fasterrcnn_mobilenet_v3_large_320_fpn"
+        batch_size: batch size
+        lr: initial learning rate
+        download: whether to automatically download dataset
+        device: either cuda or cpu
+        image_size: image size for training and validation
+    """
+    if model not in AVAILABLE_MODELS:
+        raise RuntimeError(f"Invalid model name: {model}")
+
     bbox_params = A.BboxParams(format="pascal_voc")
     train_transform = A.Compose(
         [A.Resize(image_size, image_size), A.HorizontalFlip(p=0.5), ToTensorV2()],
@@ -123,13 +148,12 @@ def run(
     val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn, num_workers=4)
     vis_dataloader = DataLoader(vis_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn, num_workers=4)
 
-    model = fasterrcnn_resnet50_fpn(pretrained=True)
+    model = getattr(detection, model)(pretrained=True)
     in_features = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = FastRCNNPredictor(in_features, 21)
     model.to(device)
 
-    if device == "cuda":
-        scaler = GradScaler()
+    scaler = GradScaler()
     optimizer = SGD(lr=lr, params=model.parameters())
     scheduler = OneCycleLR(optimizer, max_lr=lr, total_steps=len(train_dataloader) * epochs)
 
@@ -139,21 +163,14 @@ def run(
         images = list(image.to(device) for image in images)
         targets = [{k: v.to(device) for k, v in t.items() if isinstance(v, torch.Tensor)} for t in targets]
 
-        if device == "cuda":
-            with torch.cuda.amp.autocast(enabled=True):
-                loss_dict = model(images, targets)
-                loss = sum(loss for loss in loss_dict.values())
-
-            optimizer.zero_grad()
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-        else:
+        with torch.cuda.amp.autocast(enabled=True):
             loss_dict = model(images, targets)
             loss = sum(loss for loss in loss_dict.values())
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+
+        optimizer.zero_grad()
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
         loss_items = {k: v.item() for k, v in loss_dict.items()}
         loss_items["loss_average"] = loss.item() / 4
@@ -254,33 +271,4 @@ def run(
 
 
 if __name__ == "__main__":
-    parser = ArgumentParser()
-    parser.add_argument(
-        "--dataset-root",
-        type=str,
-        help="dataset root directory for VOC2012 Dataset",
-        required=False,
-        default="./dataset",
-    )
-    parser.add_argument("--log-dir", type=str, help="where to put all the logs", required=False, default="./log")
-    parser.add_argument("--epochs", type=int, default=13, help="number of epochs to train (default: 13)")
-    parser.add_argument("--batch-size", type=int, default=4, help="batch size to use")
-    parser.add_argument("--lr", type=float, default=0.01, help="initial lr to use")
-    parser.add_argument(
-        "--download", action="store_true", default=False, help="either to download dataset automatically"
-    )
-    parser.add_argument("--device", type=str, default="cuda", help="gpu or cpu")
-    parser.add_argument("--image-size", type=int, default=512, help="image size to train")
-    parser.add_argument("--experiment-name", type=str, default="test", help="name of one experiment")
-    args = parser.parse_args()
-    run(
-        args.experiment_name,
-        args.dataset_root,
-        args.log_dir,
-        args.epochs,
-        args.batch_size,
-        args.lr,
-        args.download,
-        args.device,
-        args.image_size,
-    )
+    fire.Fire(run)

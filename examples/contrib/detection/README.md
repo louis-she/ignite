@@ -3,7 +3,7 @@
 In this example, we show how to use _Ignite_ to train a image detection model with PyTorch built-in Faster RCNN implementation.
 
 - Using VOC2012 datasets (~2GB).
-- Vlidate with COCO mAP.
+- Validate with COCO mAP.
 - Visualization.
 - Aim as experiment manager.
 
@@ -12,6 +12,8 @@ In this example, we show how to use _Ignite_ to train a image detection model wi
 - pytorch-ignite: `pip install pytorch-ignite`
 - [torchvision](https://github.com/pytorch/vision): `pip install torchvision`
 - [aim](https://github.com/aimhubio/aim): `pip install aim`
+- [albumentations](https://github.com/albumentations-team/albumentations): `pip install albumentations`
+- [pycocotools](https://cocodataset.org/): `pip install pycocotools`
 
 Alternatively, install the all requirements using `pip install -r requirements.txt`.
 
