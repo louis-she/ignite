@@ -221,11 +221,11 @@ def run(
         for outputs in engine.state.model_outputs:
             for image, target, pred in zip(outputs["x"], outputs["y"], outputs["y_pred"]):
                 image = (image * 255).byte()
-                pred_labels = [Dataset.class2name[l.item()] for l in pred["labels"]]
+                pred_labels = [Dataset.class2name[label.item()] for label in pred["labels"]]
                 pred_boxes = pred["boxes"].long()
                 image = draw_bounding_boxes(image, pred_boxes, pred_labels, colors="red")
 
-                target_labels = [Dataset.class2name[l.item()] for l in target["labels"]]
+                target_labels = [Dataset.class2name[label.item()] for label in target["labels"]]
                 target_boxes = target["boxes"].long()
                 image = draw_bounding_boxes(image, target_boxes, target_labels, colors="green")
 

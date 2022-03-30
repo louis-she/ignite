@@ -9,7 +9,6 @@ from contextlib import redirect_stdout
 import numpy as np
 import pycocotools.mask as mask_util
 import torch
-from pycocotools import mask as coco_mask
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
 
@@ -82,7 +81,7 @@ class CocoEvaluator:
         self.coco_eval.accumulate()
 
     def summarize(self):
-        print(f"IoU metric: bbox")
+        print("IoU metric: bbox")
         self.coco_eval.summarize()
 
     def prepare(self, predictions):
