@@ -1,6 +1,7 @@
+import multiprocessing
 import os
 import random
-from typing import Any, Tuple
+from typing import Any, List, Tuple, Union
 
 import aim
 import albumentations as A
@@ -20,7 +21,10 @@ from torchvision.models import detection
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.utils import draw_bounding_boxes
 
+import ignite.distributed as idist
+
 from ignite.contrib.handlers.tqdm_logger import ProgressBar
+from ignite.distributed.utils import one_rank_only
 from ignite.engine import Engine
 from ignite.engine.events import Events
 from ignite.handlers import Checkpoint, DiskSaver, global_step_from_engine
@@ -101,7 +105,10 @@ def collate_fn(batch):
 
 
 def run(
+    local_rank: int,
+    device: str,
     experiment_name: str,
+    gpus: Union[int, List[int], str] = None,
     dataset_root: str = "./dataset",
     log_dir: str = "./log",
     model: str = "fasterrcnn_resnet50_fpn",
@@ -109,28 +116,8 @@ def run(
     batch_size: int = 4,
     lr: int = 0.01,
     download: bool = False,
-    device: str = "cuda",
     image_size: int = 256,
 ) -> None:
-    """
-    Args:
-        experiment_name: the name of each run
-        dataset_root: dataset root directory for VOC2012 Dataset
-        log_dir: where to put all the logs
-        epochs: number of epochs to train
-        model: model to use, possible options are
-            "fasterrcnn_resnet50_fpn",
-            "fasterrcnn_mobilenet_v3_large_fpn",
-            "fasterrcnn_mobilenet_v3_large_320_fpn"
-        batch_size: batch size
-        lr: initial learning rate
-        download: whether to automatically download dataset
-        device: either cuda or cpu
-        image_size: image size for training and validation
-    """
-    if model not in AVAILABLE_MODELS:
-        raise RuntimeError(f"Invalid model name: {model}")
-
     bbox_params = A.BboxParams(format="pascal_voc")
     train_transform = A.Compose(
         [A.Resize(image_size, image_size), A.HorizontalFlip(p=0.5), ToTensorV2()],
@@ -142,7 +129,7 @@ def run(
     val_dataset = Dataset(root=dataset_root, download=download, image_set="val", transforms=val_transform)
     vis_dataset = Subset(val_dataset, random.sample(range(len(val_dataset)), k=16))
 
-    train_dataloader = DataLoader(
+    train_dataloader = idist.auto_dataloader(
         train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, num_workers=4
     )
     val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn, num_workers=4)
@@ -151,10 +138,11 @@ def run(
     model = getattr(detection, model)(pretrained=True)
     in_features = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = FastRCNNPredictor(in_features, 21)
-    model.to(device)
+    model = idist.auto_model(model)
 
     scaler = GradScaler()
     optimizer = SGD(lr=lr, params=model.parameters())
+    optimizer = idist.auto_optim(optimizer)
     scheduler = OneCycleLR(optimizer, max_lr=lr, total_steps=len(train_dataloader) * epochs)
 
     def update_model(engine, batch):
@@ -163,7 +151,7 @@ def run(
         images = list(image.to(device) for image in images)
         targets = [{k: v.to(device) for k, v in t.items() if isinstance(v, torch.Tensor)} for t in targets]
 
-        with torch.cuda.amp.autocast(enabled=True):
+        with torch.autocast(device, enabled=True):
             loss_dict = model(images, targets)
             loss = sum(loss for loss in loss_dict.values())
 
@@ -198,6 +186,7 @@ def run(
     CocoMetric(convert_to_coco_api(val_dataset)).attach(evaluator, "mAP")
 
     @trainer.on(Events.EPOCH_COMPLETED)
+    @one_rank_only()
     def log_validation_results(engine):
         evaluator.run(val_dataloader)
         visualizer.run(vis_dataloader)
@@ -270,5 +259,71 @@ def run(
     trainer.run(train_dataloader, max_epochs=epochs)
 
 
+def main(
+    experiment_name: str,
+    gpus: Union[int, List[int], str] = "auto",
+    nproc_per_node: Union[int, str] = "auto",
+    dataset_root: str = "./dataset",
+    log_dir: str = "./log",
+    model: str = "fasterrcnn_resnet50_fpn",
+    epochs: int = 13,
+    batch_size: int = 4,
+    lr: int = 0.01,
+    download: bool = False,
+    image_size: int = 256,
+) -> None:
+    """
+    Args:
+        experiment_name: the name of each run
+        dataset_root: dataset root directory for VOC2012 Dataset
+        gpus: can be "auto", "none" or number of gpu device ids like "0,1"
+        log_dir: where to put all the logs
+        epochs: number of epochs to train
+        model: model to use, possible options are
+            "fasterrcnn_resnet50_fpn",
+            "fasterrcnn_mobilenet_v3_large_fpn",
+            "fasterrcnn_mobilenet_v3_large_320_fpn"
+        batch_size: batch size
+        lr: initial learning rate
+        download: whether to automatically download dataset
+        device: either cuda or cpu
+        image_size: image size for training and validation
+    """
+    if model not in AVAILABLE_MODELS:
+        raise RuntimeError(f"Invalid model name: {model}")
+
+    if isinstance(gpus, int):
+        gpus = (gpus,)
+    if isinstance(gpus, tuple):
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(gpus)
+    elif gpus == "auto":
+        gpus = tuple(range(torch.cuda.device_count()))
+    elif gpus == "none":
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        gpus = tuple()
+
+    ngpu = len(gpus)
+
+    backend = "nccl" if ngpu > 0 else "gloo"
+    if nproc_per_node == "auto":
+        nproc_per_node = ngpu if ngpu > 0 else max(multiprocessing.cpu_count() // 2, 1)
+
+    with idist.Parallel(backend=backend, nproc_per_node=nproc_per_node) as parallel:
+        parallel.run(
+            run,
+            "cuda" if ngpu > 0 else "cpu",
+            experiment_name,
+            gpus,
+            dataset_root,
+            log_dir,
+            model,
+            epochs,
+            batch_size,
+            lr,
+            download,
+            image_size,
+        )
+
+
 if __name__ == "__main__":
-    fire.Fire(run)
+    fire.Fire(main)
