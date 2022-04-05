@@ -1,4 +1,4 @@
-# FasterRCNN Example with Ignite
+# Image Detection Example with Ignite
 
 In this example, we show how to use _Ignite_ to train a image detection model with PyTorch built-in Faster RCNN implementation.
 

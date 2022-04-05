@@ -117,6 +117,7 @@ def run(
     lr: int = 0.01,
     download: bool = False,
     image_size: int = 256,
+    resume_from: dict = None,
 ) -> None:
     bbox_params = A.BboxParams(format="pascal_voc")
     train_transform = A.Compose(
@@ -125,9 +126,14 @@ def run(
     )
     val_transform = A.Compose([A.Resize(image_size, image_size), ToTensorV2()], bbox_params=bbox_params)
 
+    download = local_rank == 0 and download
     train_dataset = Dataset(root=dataset_root, download=download, image_set="train", transforms=train_transform)
     val_dataset = Dataset(root=dataset_root, download=download, image_set="val", transforms=val_transform)
     vis_dataset = Subset(val_dataset, random.sample(range(len(val_dataset)), k=16))
+
+    # for testing
+    train_dataset = Subset(train_dataset, range(100))
+    val_dataset = Subset(train_dataset, range(100))
 
     train_dataloader = idist.auto_dataloader(
         train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, num_workers=4
@@ -135,11 +141,7 @@ def run(
     val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn, num_workers=4)
     vis_dataloader = DataLoader(vis_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn, num_workers=4)
 
-    model = getattr(detection, model)(pretrained=True)
-    in_features = model.roi_heads.box_predictor.cls_score.in_features
-    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, 21)
     model = idist.auto_model(model)
-
     scaler = GradScaler()
     optimizer = SGD(lr=lr, params=model.parameters())
     optimizer = idist.auto_optim(optimizer)
@@ -227,7 +229,13 @@ def run(
     ProgressBar().attach(trainer, losses)
     ProgressBar().attach(evaluator)
 
-    objects_to_checkpoint = {"trainer": trainer, "model": model, "optimizer": optimizer, "lr_scheduler": scheduler}
+    objects_to_checkpoint = {
+        "trainer": trainer,
+        "model": model,
+        "optimizer": optimizer,
+        "lr_scheduler": scheduler,
+        "scaler": scaler,
+    }
     checkpoint = Checkpoint(
         to_save=objects_to_checkpoint,
         save_handler=DiskSaver(log_dir, require_empty=False),
@@ -236,6 +244,8 @@ def run(
         global_step_transform=lambda *_: trainer.state.epoch,
     )
     evaluator.add_event_handler(Events.EPOCH_COMPLETED, checkpoint)
+    if resume_from:
+        Checkpoint.load_objects(objects_to_checkpoint, torch.load(resume_from))
 
     aim_logger.log_params(
         {
@@ -261,7 +271,7 @@ def run(
 
 def main(
     experiment_name: str,
-    gpus: Union[int, List[int], str] = "auto",
+    gpus: Union[str, List[str], str] = "auto",
     nproc_per_node: Union[int, str] = "auto",
     dataset_root: str = "./dataset",
     log_dir: str = "./log",
@@ -271,6 +281,7 @@ def main(
     lr: int = 0.01,
     download: bool = False,
     image_size: int = 256,
+    resume_from: str = None,
 ) -> None:
     """
     Args:
@@ -288,6 +299,7 @@ def main(
         download: whether to automatically download dataset
         device: either cuda or cpu
         image_size: image size for training and validation
+        resume_from: path of checkpoint to resume from
     """
     if model not in AVAILABLE_MODELS:
         raise RuntimeError(f"Invalid model name: {model}")
@@ -295,7 +307,7 @@ def main(
     if isinstance(gpus, int):
         gpus = (gpus,)
     if isinstance(gpus, tuple):
-        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(gpus)
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join([str(gpu) for gpu in gpus])
     elif gpus == "auto":
         gpus = tuple(range(torch.cuda.device_count()))
     elif gpus == "none":
@@ -307,6 +319,11 @@ def main(
     backend = "nccl" if ngpu > 0 else "gloo"
     if nproc_per_node == "auto":
         nproc_per_node = ngpu if ngpu > 0 else max(multiprocessing.cpu_count() // 2, 1)
+
+    # to precent multiple download for preatrined checkpoint, create model in the main process
+    model = getattr(detection, model)(pretrained=True)
+    in_features = model.roi_heads.box_predictor.cls_score.in_features
+    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, 21)
 
     with idist.Parallel(backend=backend, nproc_per_node=nproc_per_node) as parallel:
         parallel.run(
@@ -322,6 +339,7 @@ def main(
             lr,
             download,
             image_size,
+            resume_from,
         )
 
 
