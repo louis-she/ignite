@@ -1,7 +1,7 @@
 import multiprocessing
 import os
 import random
-from typing import Any, List, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 import aim
 import albumentations as A
@@ -19,6 +19,7 @@ from torch.utils.data import DataLoader, Subset
 from torchvision.datasets import VOCDetection
 from torchvision.models import detection
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from torchvision.models.detection.retinanet import RetinaNetClassificationHead
 from torchvision.utils import draw_bounding_boxes
 
 import ignite.distributed as idist
@@ -39,6 +40,7 @@ AVAILABLE_MODELS = [
     "fasterrcnn_resnet50_fpn",
     "fasterrcnn_mobilenet_v3_large_fpn",
     "fasterrcnn_mobilenet_v3_large_320_fpn",
+    "retinanet_resnet50_fpn",
 ]
 
 
@@ -108,32 +110,28 @@ def run(
     local_rank: int,
     device: str,
     experiment_name: str,
-    gpus: Union[int, List[int], str] = None,
+    gpus: Optional[Union[int, List[int], str]] = None,
     dataset_root: str = "./dataset",
     log_dir: str = "./log",
     model: str = "fasterrcnn_resnet50_fpn",
     epochs: int = 13,
     batch_size: int = 4,
-    lr: int = 0.01,
+    lr: float = 0.01,
     download: bool = False,
     image_size: int = 256,
-    resume_from: dict = None,
+    resume_from: Optional[dict] = None,
 ) -> None:
     bbox_params = A.BboxParams(format="pascal_voc")
     train_transform = A.Compose(
-        [A.Resize(image_size, image_size), A.HorizontalFlip(p=0.5), ToTensorV2()],
+        [A.HorizontalFlip(p=0.5), ToTensorV2()],
         bbox_params=bbox_params,
     )
-    val_transform = A.Compose([A.Resize(image_size, image_size), ToTensorV2()], bbox_params=bbox_params)
+    val_transform = A.Compose([ToTensorV2()], bbox_params=bbox_params)
 
     download = local_rank == 0 and download
     train_dataset = Dataset(root=dataset_root, download=download, image_set="train", transforms=train_transform)
     val_dataset = Dataset(root=dataset_root, download=download, image_set="val", transforms=val_transform)
     vis_dataset = Subset(val_dataset, random.sample(range(len(val_dataset)), k=16))
-
-    # for testing
-    train_dataset = Subset(train_dataset, range(100))
-    val_dataset = Subset(train_dataset, range(100))
 
     train_dataloader = idist.auto_dataloader(
         train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, num_workers=4
@@ -322,8 +320,15 @@ def main(
 
     # to precent multiple download for preatrined checkpoint, create model in the main process
     model = getattr(detection, model)(pretrained=True)
-    in_features = model.roi_heads.box_predictor.cls_score.in_features
-    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, 21)
+
+    if model.__class__.__name__ == "FasterRCNN":
+        in_features = model.roi_heads.box_predictor.cls_score.in_features
+        model.roi_heads.box_predictor = FastRCNNPredictor(in_features, 21)
+    elif model.__class__.__name__ == "RetinaNet":
+        head = RetinaNetClassificationHead(
+            model.backbone.out_channels, model.anchor_generator.num_anchors_per_location()[0], num_classes=21
+        )
+        model.head.classification_head = head
 
     with idist.Parallel(backend=backend, nproc_per_node=nproc_per_node) as parallel:
         parallel.run(
