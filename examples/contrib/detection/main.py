@@ -2,6 +2,7 @@ import multiprocessing
 import os
 import random
 from typing import Any, List, Optional, Tuple, Union
+from functools import partial
 
 import aim
 import albumentations as A
@@ -71,9 +72,16 @@ class Dataset(VOCDetection):
     name2class = {v: k + 1 for k, v in enumerate(classes)}
     class2name = {k + 1: v for k, v in enumerate(classes)}
 
-    def __getitem__(self, index: int) -> Tuple[Any, Any]:
-        img = np.array(Image.open(self.images[index]).convert("RGB"))
-        annotation = self.parse_voc_xml(ET_parse(self.annotations[index]).getroot())["annotation"]
+    def __init__(self, transforms: A.BasicTransform, *args, **kwargs):
+        self.albu_transform = transforms
+        super().__init__(*args, **kwargs)
+        self.transforms = partial(self._transforms, self)
+
+    @staticmethod
+    def _transforms(self, img, target):
+        # make transforms a staticmethod to prevent
+        # maximum recursion of `repr` method
+        annotation = target['annotation']
         bbox_classes = list(
             map(
                 lambda x: (
@@ -86,16 +94,18 @@ class Dataset(VOCDetection):
                 annotation["object"],
             )
         )
-        if self.transforms is not None:
-            result = self.transforms(image=img, bboxes=bbox_classes)
-        image, bbox_classes = result["image"] / 255.0, result["bboxes"]
-        bboxes = np.stack([a[:4] for a in bbox_classes])
-        labels = [self.name2class[a[4]] for a in bbox_classes]
+        result = self.albu_transform(image=np.array(img), bboxes=bbox_classes)
+        annotation["bboxes"] = result["bboxes"]
+        return result['image'] / 255.0, annotation
 
+    def __getitem__(self, index: int) -> Tuple[Any, Any]:
+        image, annotation = super().__getitem__(index)
+        bboxes = np.stack([a[:4] for a in annotation["bboxes"]])
+        labels = [self.name2class[a[4]] for a in annotation["bboxes"]]
         target = {}
         target["boxes"] = torch.tensor(bboxes)
         target["labels"] = torch.tensor(labels)
-        target["image_id"] = annotation["filename"]
+        target["image_id"] = annotation['filename']
         target["area"] = torch.tensor((bboxes[:, 3] - bboxes[:, 1]) * (bboxes[:, 2] - bboxes[:, 0]))
         target["iscrowd"] = torch.tensor([False] * len(bboxes))
 
@@ -110,7 +120,6 @@ def run(
     local_rank: int,
     device: str,
     experiment_name: str,
-    gpus: Optional[Union[int, List[int], str]] = None,
     dataset_root: str = "./dataset",
     log_dir: str = "./log",
     model: str = "fasterrcnn_resnet50_fpn",
@@ -118,8 +127,8 @@ def run(
     batch_size: int = 4,
     lr: float = 0.01,
     download: bool = False,
-    image_size: int = 256,
     resume_from: Optional[dict] = None,
+    visualize_images: int = 16,
 ) -> None:
     bbox_params = A.BboxParams(format="pascal_voc")
     train_transform = A.Compose(
@@ -131,7 +140,7 @@ def run(
     download = local_rank == 0 and download
     train_dataset = Dataset(root=dataset_root, download=download, image_set="train", transforms=train_transform)
     val_dataset = Dataset(root=dataset_root, download=download, image_set="val", transforms=val_transform)
-    vis_dataset = Subset(val_dataset, random.sample(range(len(val_dataset)), k=16))
+    vis_dataset = Subset(val_dataset, random.sample(range(len(val_dataset)), k=visualize_images))
 
     train_dataloader = idist.auto_dataloader(
         train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, num_workers=4
@@ -196,29 +205,21 @@ def run(
         scheduler.step()
         aim_logger.log_metrics({"lr": scheduler.get_last_lr()[0]}, step=engine.state.iteration)
 
-    @visualizer.on(Events.EPOCH_STARTED)
-    def reset_vis_images(engine):
-        engine.state.model_outputs = []
-
-    @visualizer.on(Events.ITERATION_COMPLETED)
-    def add_vis_images(engine):
-        engine.state.model_outputs.append(engine.state.output)
-
     @visualizer.on(Events.ITERATION_COMPLETED)
     def submit_vis_images(engine):
         aim_images = []
-        for outputs in engine.state.model_outputs:
-            for image, target, pred in zip(outputs["x"], outputs["y"], outputs["y_pred"]):
-                image = (image * 255).byte()
-                pred_labels = [Dataset.class2name[label.item()] for label in pred["labels"]]
-                pred_boxes = pred["boxes"].long()
-                image = draw_bounding_boxes(image, pred_boxes, pred_labels, colors="red")
+        outputs = engine.state.output
+        for image, target, pred in zip(outputs["x"], outputs["y"], outputs["y_pred"]):
+            image = (image * 255).byte()
+            pred_labels = [Dataset.class2name[label.item()] for label in pred["labels"]]
+            pred_boxes = pred["boxes"].long()
+            image = draw_bounding_boxes(image, pred_boxes, pred_labels, colors="red")
 
-                target_labels = [Dataset.class2name[label.item()] for label in target["labels"]]
-                target_boxes = target["boxes"].long()
-                image = draw_bounding_boxes(image, target_boxes, target_labels, colors="green")
+            target_labels = [Dataset.class2name[label.item()] for label in target["labels"]]
+            target_boxes = target["boxes"].long()
+            image = draw_bounding_boxes(image, target_boxes, target_labels, colors="green")
 
-                aim_images.append(aim.Image(image.numpy().transpose((1, 2, 0))))
+            aim_images.append(aim.Image(image.numpy().transpose((1, 2, 0))))
         aim_logger.experiment.track(aim_images, name="vis", step=trainer.state.epoch)
 
     losses = ["loss_classifier", "loss_box_reg", "loss_objectness", "loss_rpn_box_reg", "loss_average"]
@@ -248,7 +249,6 @@ def run(
     aim_logger.log_params(
         {
             "lr": lr,
-            "image_size": image_size,
             "batch_size": batch_size,
             "epochs": epochs,
         }
@@ -278,8 +278,8 @@ def main(
     batch_size: int = 4,
     lr: int = 0.01,
     download: bool = False,
-    image_size: int = 256,
     resume_from: str = None,
+    visualize_images: int = 16,
 ) -> None:
     """
     Args:
@@ -296,8 +296,8 @@ def main(
         lr: initial learning rate
         download: whether to automatically download dataset
         device: either cuda or cpu
-        image_size: image size for training and validation
         resume_from: path of checkpoint to resume from
+        visualize_images: number of images to visualize each epoch
     """
     if model not in AVAILABLE_MODELS:
         raise RuntimeError(f"Invalid model name: {model}")
@@ -318,7 +318,7 @@ def main(
     if nproc_per_node == "auto":
         nproc_per_node = ngpu if ngpu > 0 else max(multiprocessing.cpu_count() // 2, 1)
 
-    # to precent multiple download for preatrined checkpoint, create model in the main process
+    # to prevent multiple downloads for prestrained checkpoint, create the model in the main process
     model = getattr(detection, model)(pretrained=True)
 
     if model.__class__.__name__ == "FasterRCNN":
@@ -335,7 +335,6 @@ def main(
             run,
             "cuda" if ngpu > 0 else "cpu",
             experiment_name,
-            gpus,
             dataset_root,
             log_dir,
             model,
@@ -343,8 +342,8 @@ def main(
             batch_size,
             lr,
             download,
-            image_size,
             resume_from,
+            visualize_images,
         )
 
 
