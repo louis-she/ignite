@@ -1,8 +1,8 @@
 import multiprocessing
 import os
 import random
-from typing import Any, List, Optional, Tuple, Union
 from functools import partial
+from typing import Any, List, Optional, Tuple, Union
 
 import aim
 import albumentations as A
@@ -81,7 +81,7 @@ class Dataset(VOCDetection):
     def _transforms(self, img, target):
         # make transforms a staticmethod to prevent
         # maximum recursion of `repr` method
-        annotation = target['annotation']
+        annotation = target["annotation"]
         bbox_classes = list(
             map(
                 lambda x: (
@@ -96,7 +96,7 @@ class Dataset(VOCDetection):
         )
         result = self.albu_transform(image=np.array(img), bboxes=bbox_classes)
         annotation["bboxes"] = result["bboxes"]
-        return result['image'] / 255.0, annotation
+        return result["image"] / 255.0, annotation
 
     def __getitem__(self, index: int) -> Tuple[Any, Any]:
         image, annotation = super().__getitem__(index)
@@ -105,7 +105,7 @@ class Dataset(VOCDetection):
         target = {}
         target["boxes"] = torch.tensor(bboxes)
         target["labels"] = torch.tensor(labels)
-        target["image_id"] = annotation['filename']
+        target["image_id"] = annotation["filename"]
         target["area"] = torch.tensor((bboxes[:, 3] - bboxes[:, 1]) * (bboxes[:, 2] - bboxes[:, 0]))
         target["iscrowd"] = torch.tensor([False] * len(bboxes))
 
